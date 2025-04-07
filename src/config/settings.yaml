@@ -1,0 +1,66 @@
+# Default configuration settings for AWS Data Lake Framework
+
+# AWS settings
+aws:
+  region: us-east-1
+  profile: default
+  glue:
+    version: "5.0"
+    python_version: "3.9"
+    max_concurrent_runs: 10
+    timeout_minutes: 60
+    worker_type: G.1X
+    number_of_workers: 5
+    job_bookmark: job-bookmark-enable
+
+# S3 settings
+s3:
+  # Bronze layer (raw data)
+  bronze:
+    bucket: "data-lake-bronze"
+    prefix: "raw/"
+    
+  # Silver layer (processed data)
+  silver:
+    bucket: "data-lake-silver"
+    prefix: "processed/"
+    
+  # Temporary storage
+  temp:
+    bucket: "data-lake-temp"
+    prefix: "temp/"
+
+# S3Tables settings for Silver layer
+s3tables:
+  version: "latest"
+  format: "parquet"
+  compression: "snappy"
+  partition_cols: []  # Default empty, override per table
+
+# Logging settings
+logging:
+  level: INFO
+  format: json
+  destination: cloudwatch
+  cloudwatch:
+    log_group: "/aws/glue/jobs"
+  local:
+    log_dir: "logs"
+    max_size_mb: 10
+    backup_count: 5
+
+# Error handling
+errors:
+  max_retries: 3
+  retry_delay_seconds: 5
+  alert_on_failure: true
+  sns_topic_arn: ""  # Set this in environment-specific config
+
+# Environment settings
+environment: development  # development, staging, production
+
+# Local development
+local_dev:
+  mock_aws: true
+  data_dir: "local_dev/data"
+  output_dir: "local_dev/output"

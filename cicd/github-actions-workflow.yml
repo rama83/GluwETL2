@@ -1,0 +1,329 @@
+name: AWS Data Lake ETL CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      run_jobs:
+        description: 'Run ETL jobs after deployment'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  test:
+    name: Test ETL Scripts
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run linting
+        run: |
+          pip install flake8 mypy
+          flake8 src/ tests/ local_dev/
+          mypy src/ tests/ local_dev/
+      
+      - name: Run unit tests
+        run: |
+          pip install pytest pytest-cov
+          pytest tests/ --cov=src --cov-report=xml
+      
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+  
+  deploy:
+    name: Deploy ETL Scripts
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install boto3 awscli
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Upload ETL scripts to S3
+        run: |
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+          S3_BUCKET="${{ secrets.S3_SCRIPTS_BUCKET }}"
+          
+          # Create a deployment package
+          mkdir -p deployment
+          cp -r src/ deployment/
+          cp requirements.txt deployment/
+          
+          # Upload to S3
+          aws s3 sync deployment/ s3://${S3_BUCKET}/${ENVIRONMENT}/
+          
+          echo "ETL scripts uploaded to s3://${S3_BUCKET}/${ENVIRONMENT}/"
+      
+      - name: Create or update Glue jobs
+        run: |
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+          S3_BUCKET="${{ secrets.S3_SCRIPTS_BUCKET }}"
+          
+          # Bronze layer Spark job
+          python -c "
+          import boto3
+          import json
+          
+          glue = boto3.client('glue')
+          
+          job_name = 'bronze-spark-ingest-${ENVIRONMENT}'
+          script_location = f's3://${S3_BUCKET}/${ENVIRONMENT}/src/bronze/spark_ingest.py'
+          
+          try:
+              # Check if job exists
+              glue.get_job(JobName=job_name)
+              
+              # Update job
+              glue.update_job(
+                  JobName=job_name,
+                  JobUpdate={
+                      'Role': '${{ secrets.GLUE_ROLE_ARN }}',
+                      'Command': {
+                          'Name': 'glueetl',
+                          'ScriptLocation': script_location,
+                          'PythonVersion': '3.9',
+                      },
+                      'DefaultArguments': {
+                          '--job-language': 'python',
+                          '--job-bookmark-option': 'job-bookmark-enable',
+                          '--enable-metrics': 'true',
+                          '--enable-continuous-cloudwatch-log': 'true',
+                          '--enable-spark-ui': 'true',
+                      },
+                      'GlueVersion': '5.0',
+                      'WorkerType': 'G.1X',
+                      'NumberOfWorkers': 5,
+                  }
+              )
+              print(f'Updated Glue job: {job_name}')
+          except glue.exceptions.EntityNotFoundException:
+              # Create job
+              glue.create_job(
+                  Name=job_name,
+                  Role='${{ secrets.GLUE_ROLE_ARN }}',
+                  Command={
+                      'Name': 'glueetl',
+                      'ScriptLocation': script_location,
+                      'PythonVersion': '3.9',
+                  },
+                  DefaultArguments={
+                      '--job-language': 'python',
+                      '--job-bookmark-option': 'job-bookmark-enable',
+                      '--enable-metrics': 'true',
+                      '--enable-continuous-cloudwatch-log': 'true',
+                      '--enable-spark-ui': 'true',
+                  },
+                  GlueVersion='5.0',
+                  WorkerType='G.1X',
+                  NumberOfWorkers=5,
+              )
+              print(f'Created Glue job: {job_name}')
+          "
+          
+          # Bronze layer Python shell job
+          python -c "
+          import boto3
+          import json
+          
+          glue = boto3.client('glue')
+          
+          job_name = 'bronze-python-ingest-${ENVIRONMENT}'
+          script_location = f's3://${S3_BUCKET}/${ENVIRONMENT}/src/bronze/python_ingest.py'
+          
+          try:
+              # Check if job exists
+              glue.get_job(JobName=job_name)
+              
+              # Update job
+              glue.update_job(
+                  JobName=job_name,
+                  JobUpdate={
+                      'Role': '${{ secrets.GLUE_ROLE_ARN }}',
+                      'Command': {
+                          'Name': 'pythonshell',
+                          'ScriptLocation': script_location,
+                          'PythonVersion': '3.9',
+                      },
+                      'DefaultArguments': {
+                          '--job-language': 'python',
+                          '--job-bookmark-option': 'job-bookmark-enable',
+                          '--enable-metrics': 'true',
+                          '--enable-continuous-cloudwatch-log': 'true',
+                      },
+                      'GlueVersion': '5.0',
+                      'MaxCapacity': 0.0625,
+                  }
+              )
+              print(f'Updated Glue job: {job_name}')
+          except glue.exceptions.EntityNotFoundException:
+              # Create job
+              glue.create_job(
+                  Name=job_name,
+                  Role='${{ secrets.GLUE_ROLE_ARN }}',
+                  Command={
+                      'Name': 'pythonshell',
+                      'ScriptLocation': script_location,
+                      'PythonVersion': '3.9',
+                  },
+                  DefaultArguments={
+                      '--job-language': 'python',
+                      '--job-bookmark-option': 'job-bookmark-enable',
+                      '--enable-metrics': 'true',
+                      '--enable-continuous-cloudwatch-log': 'true',
+                  },
+                  GlueVersion='5.0',
+                  MaxCapacity=0.0625,
+              )
+              print(f'Created Glue job: {job_name}')
+          "
+          
+          # Silver layer Spark job
+          python -c "
+          import boto3
+          import json
+          
+          glue = boto3.client('glue')
+          
+          job_name = 'silver-spark-process-${ENVIRONMENT}'
+          script_location = f's3://${S3_BUCKET}/${ENVIRONMENT}/src/silver/spark_process.py'
+          
+          try:
+              # Check if job exists
+              glue.get_job(JobName=job_name)
+              
+              # Update job
+              glue.update_job(
+                  JobName=job_name,
+                  JobUpdate={
+                      'Role': '${{ secrets.GLUE_ROLE_ARN }}',
+                      'Command': {
+                          'Name': 'glueetl',
+                          'ScriptLocation': script_location,
+                          'PythonVersion': '3.9',
+                      },
+                      'DefaultArguments': {
+                          '--job-language': 'python',
+                          '--job-bookmark-option': 'job-bookmark-enable',
+                          '--enable-metrics': 'true',
+                          '--enable-continuous-cloudwatch-log': 'true',
+                          '--enable-spark-ui': 'true',
+                      },
+                      'GlueVersion': '5.0',
+                      'WorkerType': 'G.1X',
+                      'NumberOfWorkers': 5,
+                  }
+              )
+              print(f'Updated Glue job: {job_name}')
+          except glue.exceptions.EntityNotFoundException:
+              # Create job
+              glue.create_job(
+                  Name=job_name,
+                  Role='${{ secrets.GLUE_ROLE_ARN }}',
+                  Command={
+                      'Name': 'glueetl',
+                      'ScriptLocation': script_location,
+                      'PythonVersion': '3.9',
+                  },
+                  DefaultArguments={
+                      '--job-language': 'python',
+                      '--job-bookmark-option': 'job-bookmark-enable',
+                      '--enable-metrics': 'true',
+                      '--enable-continuous-cloudwatch-log': 'true',
+                      '--enable-spark-ui': 'true',
+                  },
+                  GlueVersion='5.0',
+                  WorkerType='G.1X',
+                  NumberOfWorkers=5,
+              )
+              print(f'Created Glue job: {job_name}')
+          "
+  
+  run_jobs:
+    name: Run ETL Jobs
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_jobs == 'true'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Determine environment
+        id: env
+        run: |
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+      
+      - name: Run ETL jobs
+        run: |
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+          
+          # Run Bronze layer jobs
+          aws glue start-job-run --job-name "bronze-spark-ingest-${ENVIRONMENT}" --arguments='{"--source_type":"csv","--source_path":"s3://data-lake-bronze/raw/sample.csv","--target_path":"s3://data-lake-bronze/raw/processed/","--file_format":"parquet"}'
+          aws glue start-job-run --job-name "bronze-python-ingest-${ENVIRONMENT}" --arguments='{"--source-type":"csv","--source-path":"s3://data-lake-bronze/raw/sample.csv","--target-key":"raw/processed/sample.parquet","--file-format":"parquet"}'
+          
+          # Wait for Bronze layer jobs to complete
+          echo "Waiting for Bronze layer jobs to complete..."
+          sleep 300
+          
+          # Run Silver layer job
+          aws glue start-job-run --job-name "silver-spark-process-${ENVIRONMENT}" --arguments='{"--source_path":"s3://data-lake-bronze/raw/processed/","--source_format":"parquet","--table_name":"sample_table","--apply_quality_checks":"true"}'
