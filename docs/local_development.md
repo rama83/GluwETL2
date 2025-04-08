@@ -161,9 +161,239 @@ You can use Docker to create a containerized development environment:
    python local_dev/test_etl.py --pipeline bronze-python --data-size 1000 --output-dir local_dev/output
    ```
 
+## AWS Glue 5.0 Local Development Workflow
+
+This section provides a comprehensive workflow for developing and testing AWS Glue 5.0 jobs locally using the Docker container before deploying them to AWS.
+
+### Setting Up AWS Credentials for Local Development
+
+To use AWS services from the local Docker container, you need to set up AWS credentials:
+
+1. **Create or update your AWS credentials file**:
+
+   ```bash
+   mkdir -p ~/.aws
+   touch ~/.aws/credentials
+   ```
+
+   Edit the file to include your AWS credentials:
+
+   ```ini
+   [default]
+   aws_access_key_id = YOUR_ACCESS_KEY
+   aws_secret_access_key = YOUR_SECRET_KEY
+   ```
+
+2. **Create or update your AWS config file**:
+
+   ```bash
+   touch ~/.aws/config
+   ```
+
+   Edit the file to include your AWS region:
+
+   ```ini
+   [default]
+   region = us-east-1
+   ```
+
+3. **Mount the credentials in the Docker container**:
+
+   The Docker Compose file already includes a volume mount for the AWS credentials:
+
+   ```yaml
+   volumes:
+     - ~/.aws:/home/glue_user/.aws:ro
+   ```
+
+### Local Development Workflow with AWS Glue 5.0
+
+Follow this workflow to develop and test AWS Glue 5.0 jobs locally:
+
+1. **Start the AWS Glue 5.0 Docker container**:
+
+   ```bash
+   docker-compose up -d
+   ```
+
+2. **Develop your ETL job**:
+
+   a. **Using Jupyter notebooks**:
+      - Access Jupyter at http://localhost:8888
+      - Create a new notebook
+      - Develop and test your ETL code interactively
+
+   b. **Using your preferred IDE**:
+      - Develop your ETL scripts in your IDE
+      - Mount your project directory to the container
+      - Run and test the scripts inside the container
+
+3. **Test with local data**:
+
+   a. **Create a test data directory**:
+      ```bash
+      mkdir -p local_dev/data/test
+      ```
+
+   b. **Generate or copy test data**:
+      ```bash
+      # Example: Generate CSV test data
+      python -c "import pandas as pd; pd.DataFrame({'id': range(1000), 'value': range(1000)}).to_csv('local_dev/data/test/sample.csv', index=False)"
+      ```
+
+4. **Run your ETL job locally**:
+
+   ```bash
+   docker exec -it glue-local-dev bash -c "cd /home/glue_user/workspace && python src/bronze/spark_ingest.py --JOB_NAME test-job --source_type csv --source_path local_dev/data/test/sample.csv --target_path local_dev/output/bronze --file_format parquet"
+   ```
+
+5. **Validate the results**:
+
+   ```bash
+   docker exec -it glue-local-dev bash -c "cd /home/glue_user/workspace && ls -la local_dev/output/bronze"
+   ```
+
+### Creating AWS Glue 5.0 Jobs
+
+To create AWS Glue 5.0 jobs that can run both locally and in AWS:
+
+1. **Structure your ETL script**:
+
+   ```python
+   import sys
+   from awsglue.transforms import *
+   from awsglue.utils import getResolvedOptions
+   from pyspark.context import SparkContext
+   from awsglue.context import GlueContext
+   from awsglue.job import Job
+
+   # Get job parameters
+   args = getResolvedOptions(sys.argv, ['JOB_NAME', 'source_path', 'target_path'])
+
+   # Initialize Spark and Glue contexts
+   sc = SparkContext()
+   glueContext = GlueContext(sc)
+   spark = glueContext.spark_session
+   job = Job(glueContext)
+   job.init(args['JOB_NAME'], args)
+
+   # Your ETL code here
+   # ...
+
+   # Commit the job
+   job.commit()
+   ```
+
+2. **Make your code environment-aware**:
+
+   ```python
+   # Detect if running locally or in AWS
+   is_local = 'GLUE_CONTAINER' in os.environ
+
+   # Use different paths based on environment
+   if is_local:
+       # Local paths
+       source_path = args['source_path']
+       target_path = args['target_path']
+   else:
+       # AWS paths
+       source_path = f"s3://{config.get('s3.bronze.bucket')}/{args['source_path']}"
+       target_path = f"s3://{config.get('s3.silver.bucket')}/{args['target_path']}"
+   ```
+
+### Testing AWS Glue 5.0 Jobs
+
+To test your AWS Glue 5.0 jobs thoroughly:
+
+1. **Unit testing with pytest**:
+
+   Create a `tests/test_glue_jobs.py` file:
+
+   ```python
+   import pytest
+   from pyspark.sql import SparkSession
+   from awsglue.context import GlueContext
+   from awsglue.job import Job
+   from pyspark.context import SparkContext
+
+   @pytest.fixture(scope="module")
+   def glue_context():
+       """Create a Glue context for testing."""
+       sc = SparkContext()
+       glueContext = GlueContext(sc)
+       spark = glueContext.spark_session
+       job = Job(glueContext)
+       job.init("test-job", {})
+       
+       yield glueContext
+       
+       # Clean up
+       sc.stop()
+
+   def test_transform_data(glue_context):
+       """Test the data transformation logic."""
+       # Create test data
+       test_data = [("1", "value1"), ("2", "value2")]
+       spark = glue_context.spark_session
+       df = spark.createDataFrame(test_data, ["id", "value"])
+       
+       # Import your transformation function
+       from your_module import transform_data
+       
+       # Apply the transformation
+       result = transform_data(df)
+       
+       # Assert the expected results
+       assert result.count() == 2
+       assert "transformed_value" in result.columns
+   ```
+
+2. **Run the tests inside the Docker container**:
+
+   ```bash
+   docker exec -it glue-local-dev bash -c "cd /home/glue_user/workspace && python -m pytest tests/test_glue_jobs.py -v"
+   ```
+
+### Deploying AWS Glue 5.0 Jobs to AWS
+
+Once your jobs are tested locally, deploy them to AWS:
+
+1. **Upload your script to S3**:
+
+   ```python
+   from src.utils.glue_utils import upload_script
+
+   script_location = upload_script("src/bronze/spark_ingest.py")
+   ```
+
+2. **Create the Glue job**:
+
+   ```python
+   from src.utils.glue_utils import create_spark_job
+
+   job_response = create_spark_job(
+       job_name="bronze-spark-ingest",
+       script_location=script_location,
+       default_arguments={
+           "--source_type": "csv",
+           "--source_path": "raw/data",
+           "--target_path": "bronze/data",
+           "--file_format": "parquet"
+       }
+   )
+   ```
+
+3. **Run the job**:
+
+   ```python
+   from src.utils.glue_utils import run_job_and_wait
+
+   job_run = run_job_and_wait("bronze-spark-ingest")
+   ```
+
 ## Mocking AWS Services
 
-The framework uses the `moto` library to mock AWS services for local testing.
+For testing without Docker, the framework uses the `moto` library to mock AWS services for local testing.
 
 ### Mocking S3
 

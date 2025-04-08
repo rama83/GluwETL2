@@ -1,0 +1,18 @@
+version: '3'
+services:
+  glue-container:
+    image: amazon/aws-glue-libs:glue_libs_5.0.0_image_01
+    container_name: glue-local-dev
+    environment:
+      - AWS_PROFILE=default
+      - AWS_REGION=us-east-1
+      - DISABLE_SSL=true
+      - GLUE_CONTAINER=true
+    volumes:
+      - .:/home/glue_user/workspace/
+      - ~/.aws:/home/glue_user/.aws:ro
+    ports:
+      - "8888:8888"  # Jupyter Notebook
+      - "4040:4040"  # Spark UI
+      - "18080:18080"  # Spark History Server
+    command: "/home/glue_user/jupyter/jupyter_start.sh"
